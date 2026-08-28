@@ -6,6 +6,8 @@ import json
 import logging
 from pathlib import Path
 from faster_whisper import WhisperModel
+from app.database.sqlite import get_transcribed_segment_indices, mark_segment_status, update_video_status
+
 
 from app.config import WHISPER_MODEL, TRANSCRIPT_DIR
 
@@ -35,22 +37,29 @@ def transcribe_segment(segment_path: str) -> list[dict]:
 
 
 def transcribe_video(segment_paths: list[str], video_id: str) -> list[dict]:
-    """Transcribe all segments for a video, offsetting timestamps to be video-relative, and save to disk."""
+    already_done = get_transcribed_segment_indices(video_id)
+    update_video_status(video_id, "transcribing")
+
     full_transcript = []
     time_offset = 0.0
-    segment_length_sec = 10 * 60  # matches SEGMENT_LENGTH_MS in audio.py
+    segment_length_sec = 10 * 60
 
     for i, segment_path in enumerate(segment_paths):
-        logger.info(f"Transcribing segment {i+1}/{len(segment_paths)} for {video_id}")
-        chunks = transcribe_segment(segment_path)
+        if i in already_done:
+            logger.info(f"Skipping segment {i} for {video_id} — already transcribed")
+            time_offset += segment_length_sec
+            continue
 
+        chunks = transcribe_segment(segment_path)
         for chunk in chunks:
             chunk["start"] += time_offset
             chunk["end"] += time_offset
             full_transcript.append(chunk)
 
+        mark_segment_status(video_id, i, "transcribed")
         time_offset += segment_length_sec
 
+    update_video_status(video_id, "transcribed")
     _save_transcript(full_transcript, video_id)
     return full_transcript
 
