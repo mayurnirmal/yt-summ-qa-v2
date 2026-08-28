@@ -2,18 +2,18 @@
 Transcribes audio segments to text using faster-whisper, with per-segment timestamps.
 Consumes segment paths from audio.py — output feeds directly into rag/documents.py.
 """
+# app/ingestion/transcription.py — replace _save_transcript and transcribe_video
 import json
 import logging
 from pathlib import Path
 from faster_whisper import WhisperModel
-from app.database.sqlite import get_transcribed_segment_indices, mark_segment_status, update_video_status
-
 
 from app.config import WHISPER_MODEL, TRANSCRIPT_DIR
+from app.database.sqlite import get_transcribed_segment_indices, mark_segment_status, update_video_status
 
 logger = logging.getLogger(__name__)
 
-_model = None  # lazy-loaded singleton — loading whisper is expensive, don't reload per segment
+_model = None
 
 
 def _get_model() -> WhisperModel:
@@ -25,15 +25,26 @@ def _get_model() -> WhisperModel:
 
 
 def transcribe_segment(segment_path: str) -> list[dict]:
-    """Transcribe one audio segment. Returns list of {text, start, end} per whisper segment."""
     model = _get_model()
     segments, _info = model.transcribe(segment_path, beam_size=5)
+    return [{"text": seg.text.strip(), "start": seg.start, "end": seg.end} for seg in segments]
 
-    result = [
-        {"text": seg.text.strip(), "start": seg.start, "end": seg.end}
-        for seg in segments
-    ]
-    return result
+
+def _segment_cache_path(video_id: str, segment_index: int) -> Path:
+    return Path(TRANSCRIPT_DIR) / video_id / f"segment_{segment_index:03d}.json"
+
+
+def _save_segment_cache(chunks: list[dict], video_id: str, segment_index: int):
+    path = _segment_cache_path(video_id, segment_index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+
+
+def _load_segment_cache(video_id: str, segment_index: int) -> list[dict]:
+    path = _segment_cache_path(video_id, segment_index)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def transcribe_video(segment_paths: list[str], video_id: str) -> list[dict]:
@@ -46,32 +57,38 @@ def transcribe_video(segment_paths: list[str], video_id: str) -> list[dict]:
 
     for i, segment_path in enumerate(segment_paths):
         if i in already_done:
-            logger.info(f"Skipping segment {i} for {video_id} — already transcribed")
-            time_offset += segment_length_sec
-            continue
+            try:
+                chunks = _load_segment_cache(video_id, i)
+                logger.info(f"Loaded cached segment {i} for {video_id}")
+            except FileNotFoundError:
+                # DB says done but cache is missing (stale/inconsistent state) — redo it
+                logger.warning(f"Segment {i} marked transcribed but no cache found — re-transcribing")
+                chunks = [
+                    {**c, "start": c["start"] + time_offset, "end": c["end"] + time_offset}
+                    for c in transcribe_segment(segment_path)
+                ]
+                _save_segment_cache(chunks, video_id, i)
+        else:
+            chunks = [
+                {**c, "start": c["start"] + time_offset, "end": c["end"] + time_offset}
+                for c in transcribe_segment(segment_path)
+            ]
+            _save_segment_cache(chunks, video_id, i)
+            mark_segment_status(video_id, i, "transcribed")
 
-        chunks = transcribe_segment(segment_path)
-        for chunk in chunks:
-            chunk["start"] += time_offset
-            chunk["end"] += time_offset
-            full_transcript.append(chunk)
-
-        mark_segment_status(video_id, i, "transcribed")
+        full_transcript.extend(chunks)
         time_offset += segment_length_sec
 
     update_video_status(video_id, "transcribed")
-    _save_transcript(full_transcript, video_id)
+    _save_full_transcript(full_transcript, video_id)
     return full_transcript
 
 
-def _save_transcript(transcript: list[dict], video_id: str) -> str:
-    """Persist transcript as JSON under data/transcripts/<video_id>.json — resumable checkpoint."""
-    out_dir = Path(TRANSCRIPT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{video_id}.json"
-
+def _save_full_transcript(transcript: list[dict], video_id: str) -> str:
+    """Assembled convenience copy for documents.py to read — segment caches remain the source of truth for resume."""
+    out_path = Path(TRANSCRIPT_DIR) / f"{video_id}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(transcript, f, ensure_ascii=False, indent=2)
-
     logger.info(f"Saved transcript for {video_id} -> {out_path}")
     return str(out_path)
