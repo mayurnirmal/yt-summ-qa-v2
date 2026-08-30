@@ -35,4 +35,4 @@ VECTORSTORE_DIR = f"{DATA_DIR}/vectorstores"
 DB_PATH = f"{DATA_DIR}/database/youtube_rag.db"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-TOP_K = 5
+TOP_K = 7
