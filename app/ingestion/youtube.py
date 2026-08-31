@@ -110,32 +110,29 @@ def get_video_metadata(url: str) -> dict:
 
 
 def download_audio(url: str, video_id: str | None = None) -> str:
-    """Download audio-only stream as mp3 to data/audio/<video_id>/. Returns the file path."""
+    """Download audio-only stream to its native format (no re-encoding) under data/audio/<video_id>/."""
     video_id = video_id or extract_video_id(url)
     out_dir = Path(AUDIO_DIR) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "full_audio.%(ext)s"
 
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": str(out_path),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
+        "outtmpl": str(out_dir / "full_audio.%(ext)s"),
+        "concurrent_fragment_downloads": 4,  # speeds up fragmented/DASH downloads (longer videos)
+        # no postprocessors — keep native container, skip the mp3 transcode
         "quiet": True,
         "no_warnings": True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Audio download failed for {video_id}: {e}")
         raise VideoUnavailableError(f"Could not download audio for: {url}") from e
 
-    final_path = out_dir / "full_audio.mp3"
+    downloaded_ext = info.get("ext", "m4a")
+    final_path = out_dir / f"full_audio.{downloaded_ext}"
     if not final_path.exists():
         raise VideoUnavailableError(f"Download reported success but file missing: {final_path}")
 

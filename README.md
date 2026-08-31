@@ -13,26 +13,26 @@ YouTube URL
     │
     ▼
 ┌─────────────────────┐
-│ 1. Ingestion         │  extract video ID → fetch metadata → download audio (yt-dlp → mp3)
-└─────────┬─────────────┘
+│ 1. Ingestion        │  extract video ID → fetch metadata → download audio (native format, no re-encode)
+└─────────┬───────────┘
+          ▼
+┌──────────────────────┐
+│ 2. Audio Segmentation│  split into 10-min chunks via ffmpeg stream-copy, no re-encoding (audio.py)
+└─────────┬────────────┘
           ▼
 ┌─────────────────────┐
-│ 2. Audio Segmentation│  split into 10-min chunks (audio.py)
-└─────────┬─────────────┘
+│ 3. Transcription    │  batched faster-whisper w/ VAD filtering, per-segment, timestamp-offset & cached (transcription.py)
+└─────────┬───────────┘
           ▼
 ┌─────────────────────┐
-│ 3. Transcription     │  faster-whisper, per-segment, timestamp-offset & cached (transcription.py)
-└─────────┬─────────────┘
+│ 4. Chunking         │  transcript → LangChain Documents, each tagged with a start timestamp (documents.py)
+└─────────┬───────────┘
           ▼
-┌─────────────────────┐
-│ 4. Chunking           │  transcript → LangChain Documents, each tagged with a start timestamp (documents.py)
-└─────────┬─────────────┘
-          ▼
-┌─────────────────────┐
+┌───────────────────────┐
 │ 5. Embedding + Index  │  HuggingFace sentence-transformer → FAISS index per video (embeddings.py, vectorstore.py)
 └─────────┬─────────────┘
           ▼
-┌─────────────────────┐
+┌───────────────────────┐
 │ 6. Retrieval + RAG    │  similarity search → Gemini 3.6 Flash → grounded answer + cited sources (retriever.py, chains.py, conversation.py)
 └─────────┬─────────────┘
           ▼
@@ -55,7 +55,7 @@ Every stage checks SQLite before doing work, so an interrupted run (network drop
 
 ### Retrieval & prompting
 
-- **Retrieval:** top-k similarity search (`k=5` by default, configurable) over the video's FAISS index.
+- **Retrieval:** top-k similarity search (`k=7` by default, configurable) over the video's FAISS index.
 - **Single-turn Q&A** (`chains.py`): retrieved chunks are formatted with their timestamps and stuffed into a prompt instructing Gemini to answer *only* from that context, and to say "I don't know" rather than fabricate an answer.
 - **Conversational Q&A** (`conversation.py`): follow-up questions are first rewritten into standalone questions using chat history (so "what about that?" resolves correctly), then go through the same retrieve → answer flow, with chat history threaded into the final answer prompt too.
 - **Source attribution:** every answer returns the raw chunks used to generate it, each with its `start_timestamp` and `video_id` — the UI renders these as clickable `youtube.com/watch?v=...&t=Ns` links so you can jump straight to the moment in the video.
@@ -100,25 +100,38 @@ Most tests mock external calls (yt-dlp, Whisper, Gemini) so the suite runs witho
 
 ---
 
-## 4. Advantages
+## 4. Performance
+
+Initial pipeline runs were slow on longer videos — a 45-min video took ~10 minutes end-to-end, and on a 57-min video, download + segmentation alone took ~2:30 of a ~4:46 total. The bottlenecks were unnecessary re-encoding, not a lack of raw processing power:
+
+- **Download no longer re-encodes to mp3.** Audio is kept in its native downloaded container (webm/m4a) instead of being transcoded via ffmpeg on download — Whisper resamples internally regardless, so the mp3 encode was pure overhead. `concurrent_fragment_downloads` is also enabled for faster downloads on videos delivered as fragmented/DASH streams.
+- **Segmentation uses ffmpeg stream-copy (`-c copy`) instead of `pydub`.** `pydub.export()` fully decodes and re-encodes every segment; stream-copy just cuts the container without touching the audio data, which is nearly instant by comparison. The `pydub` dependency was dropped.
+- **Transcription uses `faster-whisper`'s `BatchedInferencePipeline`** with `cpu_threads` set to the machine's full core count and `vad_filter=True` to skip silent stretches (intros, pauses) instead of running inference over dead air.
+- **`WHISPER_MODEL` is tunable via `.env`** — dropping from `base` to `small`/`tiny` trades some transcription accuracy for a further 3–4x speedup on CPU, worth testing if speed still matters more than precision for your use case.
+- **GPU is the largest remaining lever** if available (`device="cuda", compute_type="float16"`) — not used here since this is a laptop-first, CPU-only project by design.
+
+---
+
+## 5. Advantages
 
 - **Laptop-first, zero infra cost** — no Redis, Kafka, Postgres, Kubernetes, or hosted vector DB required; everything runs on local disk and a single free/cheap LLM API.
 - **Resumable by design** — every stage (download, per-segment transcription, embedding) checks existing state before redoing work, so interrupted runs don't waste time or API calls.
+- **Optimized for CPU-only speed** — re-encoding was eliminated from both download and segmentation, and transcription runs batched with silence-skipping, cutting a 45-min video from ~10 minutes to well under 5 without needing a GPU.
 - **Grounded, cited answers** — every answer traces back to a specific timestamp in a specific video, not just a plausible-sounding LLM response.
 - **Modular** — ingestion, transcription, chunking, embedding, and retrieval are independent modules behind clear function boundaries, so any one piece (e.g. swapping FAISS for another vector store) can change without touching the rest.
 - **Tested** — each module has unit tests with external calls (network, Whisper, Gemini) mocked out, so the suite is fast and CI-friendly.
 
-## 5. Known limitations
+## 6. Known limitations
 
 - **One video's context per chat session** — the UI keeps a separate `ConversationSession` per video; asking a question only searches the active video, even though multi-video retrieval is supported at the vectorstore layer (`load_multiple_vectorstores`). Combining that with per-video chat history wasn't a small extension, so it's out of scope for now.
 - **Unbounded chat history** — `ConversationSession` keeps every turn for the life of the session. Fine for a short demo conversation; a long session will eventually push prompts to an uncomfortable size and cost.
 - **Single-turn `ask()` retrieves twice** — once inside the LangChain chain, once again to surface sources to the caller, since LangChain's default runnable composition doesn't expose intermediate retriever output. Doubles embedding/search latency per single-turn question (the conversational chain doesn't have this issue).
-- **Fixed-length audio segmentation** — segments are split by a fixed 10-minute duration, not by silence/sentence boundaries, so a segment (and therefore a transcription pass) can technically start or end mid-sentence. Doesn't affect answer quality much in practice since text chunking happens after transcription, but it's a rough edge.
+- **Segment boundaries aren't frame/sentence-precise** — ffmpeg's `-c copy` can only cut on keyframes, so a segment can land up to a couple hundred ms off the requested 10-minute mark. Irrelevant for transcription quality at this granularity, but worth knowing if segment precision ever matters elsewhere.
 - **Vectorstore "completed" check is folder-presence, not integrity-checked** — if `FAISS.save_local()` ever fails partway through, the pipeline could treat a corrupt index as valid. Hasn't been observed in practice.
-- **CPU-only Whisper** — transcription runs on CPU with the `base` model for portability; larger models (or GPU) would improve transcription accuracy on unclear audio, background music, or heavy accents, at the cost of speed.
+- **CPU-only Whisper** — transcription runs on CPU for portability; a larger model or GPU would improve accuracy on unclear audio, background music, or heavy accents, at the cost of speed.
 - **No chapter-aware retrieval yet** — video chapter metadata is fetched and stored but not yet used to scope or label retrieval, despite chunks tracking only a start timestamp (not an end timestamp).
 
-## 6. What I'd improve with more time
+## 7. What I'd improve with more time
 
 - **Multi-video conversational retrieval** — let one chat session query across several processed videos, with per-source video attribution in the citations.
 - **Chapter-aware retrieval** — use the chapter metadata already being captured to let users scope questions to a specific chapter, and to give each chunk a proper start/end range instead of a single timestamp.
@@ -128,19 +141,20 @@ Most tests mock external calls (yt-dlp, Whisper, Gemini) so the suite runs witho
 - **GitHub Actions CI** — run the test suite automatically on push/PR (scaffolded in `.github/workflows/` but not yet wired up).
 - **Retry/backoff for the `"failed"` pipeline state** — currently a failed video just gets fully reprocessed (relying on caches to skip completed steps) rather than resuming precisely from its failure point.
 - **Bounded/summarized chat history** instead of an ever-growing message list, once conversations get long.
+- **GPU support toggle** — auto-detect CUDA and switch `faster-whisper`'s device/compute_type accordingly for users who do have a GPU.
 
 ---
 
-## 7. Project structure
+## 8. Project structure
 
 ```
 app/
 ├── config.py                # centralized settings, loaded from .env
 ├── pipeline.py               # orchestrates the full pipeline with resume-from-DB-state logic
 ├── ingestion/
-│   ├── youtube.py            # URL parsing, metadata, audio download
-│   ├── audio.py               # splits long audio into fixed-length segments
-│   └── transcription.py      # faster-whisper transcription, per-segment cached
+│   ├── youtube.py            # URL parsing, metadata, native-format audio download
+│   ├── audio.py               # splits long audio into fixed-length segments via ffmpeg stream-copy
+│   └── transcription.py      # batched faster-whisper transcription, per-segment cached
 ├── database/
 │   └── sqlite.py              # video/segment status tracking for resumability
 ├── rag/
