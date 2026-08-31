@@ -5,30 +5,32 @@ Consumes segment paths from audio.py — output feeds directly into rag/document
 # app/ingestion/transcription.py — replace _save_transcript and transcribe_video
 import json
 import logging
+import os
 from pathlib import Path
 from faster_whisper import WhisperModel
 
 from app.config import WHISPER_MODEL, TRANSCRIPT_DIR
 from app.database.sqlite import get_transcribed_segment_indices, mark_segment_status, update_video_status
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 logger = logging.getLogger(__name__)
 
 _model = None
+_batched_model = None
 
-
-def _get_model() -> WhisperModel:
-    global _model
-    if _model is None:
+# app/ingestion/transcription.py — updated _get_model()
+def _get_model() -> BatchedInferencePipeline:
+    global _model, _batched_model
+    if _batched_model is None:
         logger.info(f"Loading whisper model: {WHISPER_MODEL}")
-        _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    return _model
-
+        _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count())
+        _batched_model = BatchedInferencePipeline(model=_model)
+    return _batched_model
 
 def transcribe_segment(segment_path: str) -> list[dict]:
     model = _get_model()
-    segments, _info = model.transcribe(segment_path, beam_size=5)
+    segments, _info = model.transcribe(segment_path, beam_size=5, batch_size=16, vad_filter=True)
     return [{"text": seg.text.strip(), "start": seg.start, "end": seg.end} for seg in segments]
-
 
 def _segment_cache_path(video_id: str, segment_index: int) -> Path:
     return Path(TRANSCRIPT_DIR) / video_id / f"segment_{segment_index:03d}.json"
