@@ -52,3 +52,31 @@ def test_mark_segment_status_upserts_on_conflict():
 
     done = db.get_transcribed_segment_indices("vid1")
     assert done == {0}
+
+
+def test_get_video_record():
+    db.create_video_record("vid1", "Test Title", "Test Channel", 120)
+    record = db.get_video_record("vid1")
+    assert record is not None
+    assert record["video_id"] == "vid1"
+    assert record["title"] == "Test Title"
+    assert record["channel"] == "Test Channel"
+    assert record["duration"] == 120
+    assert record["status"] == "pending"
+
+    assert db.get_video_record("nonexistent") is None
+
+
+def test_get_completed_videos():
+    db.create_video_record("vid1", "Title 1", "Channel 1", 100)
+    db.create_video_record("vid2", "Title 2", "Channel 2", 200)
+    db.create_video_record("vid3", "Title 3", "Channel 3", 300)
+
+    db.update_video_status("vid1", "completed")
+    db.update_video_status("vid3", "completed")
+
+    completed = db.get_completed_videos()
+    completed_ids = [v["video_id"] for v in completed]
+    assert "vid1" in completed_ids
+    assert "vid3" in completed_ids
+    assert "vid2" not in completed_ids

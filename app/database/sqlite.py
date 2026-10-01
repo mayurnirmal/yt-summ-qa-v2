@@ -98,3 +98,20 @@ def get_transcribed_segment_indices(video_id: str) -> set[int]:
             (video_id,),
         ).fetchall()
         return {row["segment_index"] for row in rows}
+
+
+def get_video_record(video_id: str) -> dict | None:
+    """Returns the full record for a video as a dict, or None if not found."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM videos WHERE video_id = ?", (video_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_completed_videos() -> list[dict]:
+    """Returns a list of all videos marked 'completed' in the DB, ordered by newest first."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT video_id, title, channel, duration, status, error_message, created_at, updated_at "
+            "FROM videos WHERE status = 'completed' ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
