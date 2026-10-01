@@ -53,7 +53,7 @@ Every stage checks SQLite before doing work, so an interrupted run (network drop
 - **Embeddings:** `all-MiniLM-L6-v2` (sentence-transformers, via `langchain-huggingface`) — small (~80MB), fast on CPU, no API cost, and accurate enough for single-video semantic search. Runs locally, so embedding cost is zero and there's no network dependency at this stage.
 - **Vector store:** FAISS, one index per video, saved to `data/vectorstores/<video_id>/`. Chosen for zero setup (no server/service to run) and because per-video isolation means re-processing one video never touches another's data. Multi-video queries are supported by merging indexes in memory (`load_multiple_vectorstores`), not by a single shared index.
 
-### Retrieval & prompting
+### Retrieval & prompting(retrieval)
 
 - **Retrieval:** top-k similarity search (`k=7` by default, configurable) over the video's FAISS index.
 - **Single-turn Q&A** (`chains.py`): retrieved chunks are formatted with their timestamps and stuffed into a prompt instructing Gemini to answer *only* from that context, and to say "I don't know" rather than fabricate an answer.
